@@ -1,11 +1,12 @@
 --[[
-    Roblox Visual Script - Acrylic Pure Edition
+    Roblox Visual Script - Acrylic Pure Edition v2
     Features:
       - Acrylic Pure 风格 UI (毛玻璃/亚克力透明质感)
       - Feature Interface 面板 (功能开关列表)
       - 3D 信息卡片 (BillboardGui)
-      - 移动残影效果 (Afterimage Trail)
-    
+      - 移动残影效果 (Trail)
+      - 手机端悬浮按钮
+
     放置位置: StarterPlayerScripts 或 StarterGui (LocalScript)
 --]]
 
@@ -24,25 +25,21 @@ local rootPart = character:WaitForChild("HumanoidRootPart")
 -- 配置
 ---------------------------------------------------------------------------
 local CONFIG = {
-    -- 残影配置
     Afterimage = {
         Enabled = true,
-        TrailLength = 12,          -- 残影数量
-        FadeTime = 0.6,            -- 残影消散时间(秒)
-        SpawnInterval = 0.04,      -- 残影生成间隔(秒)
-        TransparencyMax = 0.85,    -- 最大透明度
-        Color = Color3.fromRGB(120, 180, 255), -- 残影色调
+        TrailLength = 0.8,
+        TrailWidth = 1.2,
+        Color = Color3.fromRGB(120, 180, 255),
+        Lifetime = 0.5,
     },
 
-    -- 3D信息卡片配置
     InfoCard = {
         Enabled = true,
-        ShowOnSelf = true,         -- 在自己角色上显示
-        ShowOnOthers = true,       -- 在其他玩家角色上显示
-        Distance = 50,             -- 最大显示距离
+        ShowOnSelf = true,
+        ShowOnOthers = true,
+        Distance = 50,
     },
 
-    -- UI配置
     UI = {
         AccentColor = Color3.fromRGB(100, 160, 255),
         BackgroundColor = Color3.fromRGB(20, 22, 30),
@@ -53,48 +50,24 @@ local CONFIG = {
         SuccessColor = Color3.fromRGB(80, 220, 160),
         DangerColor = Color3.fromRGB(255, 90, 90),
         CornerRadius = UDim.new(0, 12),
-        BlurSize = 24,
     },
 }
 
 ---------------------------------------------------------------------------
--- Acrylic Pure 风格工具函数
+-- 安全工具函数
+---------------------------------------------------------------------------
+local function safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        warn("[Acrylic Pure] " .. tostring(err))
+    end
+    return ok
+end
+
+---------------------------------------------------------------------------
+-- Acrylic Pure 风格工具
 ---------------------------------------------------------------------------
 local AcrylicPure = {}
-
-function AcrylicPure.CreateBlur(name, size, parent)
-    local blur = Instance.new("BlurEffect")
-    blur.Name = name or "AcrylicBlur"
-    blur.Size = size or CONFIG.UI.BlurSize
-    blur.Enabled = true
-    blur.Parent = parent or Lighting
-    return blur
-end
-
-function AcrylicPure.ApplyAcrylicFrame(frame, opts)
-    opts = opts or {}
-    local bgColor = opts.BackgroundColor or CONFIG.UI.CardColor
-    local bgTransparency = opts.Transparency or 0.15
-    local cornerRadius = opts.CornerRadius or CONFIG.UI.CornerRadius
-    local borderColor = opts.BorderColor or CONFIG.UI.BorderColor
-
-    frame.BackgroundColor3 = bgColor
-    frame.BackgroundTransparency = bgTransparency
-    frame.BorderSizePixel = 0
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = cornerRadius
-    corner.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = borderColor
-    stroke.Thickness = 1
-    stroke.Transparency = 0.4
-    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-    stroke.Parent = frame
-
-    return frame
-end
 
 function AcrylicPure.CreateGlow(parent, color, size)
     local glow = Instance.new("ImageLabel")
@@ -135,16 +108,14 @@ function AcrylicPure.CreateAccentLine(parent, position, size)
         ColorSequenceKeypoint.new(1, 0.7),
     })
     grad.Parent = line
-
     return line
 end
 
 ---------------------------------------------------------------------------
--- Feature Interface 面板
+-- Feature Interface
 ---------------------------------------------------------------------------
 local FeatureInterface = {}
 FeatureInterface.Features = {}
-FeatureInterface.Connections = {}
 
 function FeatureInterface:Register(name, defaultState, callback)
     self.Features[name] = {
@@ -158,7 +129,7 @@ function FeatureInterface:Set(name, state)
     if feature then
         feature.State = state
         if feature.Callback then
-            feature.Callback(state)
+            safeCall(feature.Callback, state)
         end
     end
 end
@@ -178,111 +149,77 @@ function FeatureInterface:Toggle(name)
 end
 
 ---------------------------------------------------------------------------
--- 残影系统
+-- 残影系统 (使用 Trail 对象，更稳定)
 ---------------------------------------------------------------------------
 local AfterimageSystem = {
-    pool = {},
-    active = {},
-    lastSpawn = 0,
+    trail = nil,
+    attachment0 = nil,
+    attachment1 = nil,
     connections = {},
 }
 
-function AfterimageSystem:CreateGhost(position, cframe)
-    local ghost = Instance.new("Part")
-    ghost.Name = "Afterimage"
-    ghost.Size = Vector3.new(2, 2, 1)
-    ghost.CFrame = cframe
-    ghost.Anchored = true
-    ghost.CanCollide = false
-    ghost.CastShadow = false
-    ghost.Material = Enum.Material.ForceField
-    ghost.Color = CONFIG.Afterimage.Color
-    ghost.Transparency = 0.3
-    ghost.Shape = Enum.PartType.Block
+function AfterimageSystem:Start()
+    self:Stop()
 
-    -- 残影网格效果
-    local mesh = Instance.new("SpecialMesh")
-    mesh.MeshType = Enum.MeshType.FileMesh
-    mesh.MeshId = "rbxassetid://43137890"
-    mesh.Scale = Vector3.new(2.5, 2.5, 2.5)
-    mesh.Parent = ghost
-
-    -- 发光效果
-    local light = Instance.new("PointLight")
-    light.Color = CONFIG.Afterimage.Color
-    light.Brightness = 0.5
-    light.Range = 6
-    light.Parent = ghost
-
-    ghost.Parent = workspace
-
-    -- 淡出动画
-    local tweenInfo = TweenInfo.new(
-        CONFIG.Afterimage.FadeTime,
-        Enum.EasingStyle.Quad,
-        Enum.EasingDirection.Out
-    )
-    local tween = TweenService:Create(ghost, tweenInfo, {
-        Transparency = CONFIG.Afterimage.TransparencyMax,
-        Size = Vector3.new(1.8, 1.8, 0.8),
-    })
-    tween:Play()
-
-    local lightTween = TweenService:Create(light, tweenInfo, {
-        Brightness = 0,
-        Range = 0,
-    })
-    lightTween:Play()
-
-    tween.Completed:Connect(function()
-        ghost:Destroy()
-    end)
-
-    table.insert(self.active, ghost)
-end
-
-function AfterimageSystem:Update()
-    if not CONFIG.Afterimage.Enabled then return end
     if not rootPart or not rootPart.Parent then return end
 
-    local now = tick()
-    local velocity = rootPart.AssemblyLinearVelocity
-    local speed = velocity.Magnitude
+    safeCall(function()
+        self.attachment0 = Instance.new("Attachment")
+        self.attachment0.Name = "TrailTop"
+        self.attachment0.Position = Vector3.new(0, 2, 0)
+        self.attachment0.Parent = rootPart
 
-    -- 只在移动时生成残影
-    if speed > 4 and (now - self.lastSpawn) >= CONFIG.Afterimage.SpawnInterval then
-        self:CreateGhost(rootPart.Position, rootPart.CFrame)
-        self.lastSpawn = now
+        self.attachment1 = Instance.new("Attachment")
+        self.attachment1.Name = "TrailBottom"
+        self.attachment1.Position = Vector3.new(0, -2, 0)
+        self.attachment1.Parent = rootPart
 
-        -- 限制残影数量
-        while #self.active > CONFIG.Afterimage.TrailLength do
-            local old = table.remove(self.active, 1)
-            if old and old.Parent then
-                old:Destroy()
-            end
-        end
-    end
-end
-
-function AfterimageSystem:Start()
-    table.insert(self.connections,
-        RunService.Heartbeat:Connect(function()
-            self:Update()
-        end)
-    )
+        self.trail = Instance.new("Trail")
+        self.trail.Name = "AfterimageTrail"
+        self.trail.Attachment0 = self.attachment0
+        self.trail.Attachment1 = self.attachment1
+        self.trail.Lifetime = CONFIG.Afterimage.Lifetime
+        self.trail.MinLength = 0.1
+        self.trail.FaceCamera = true
+        self.trail.LightEmission = 0.8
+        self.trail.LightInfluence = 0
+        self.trail.Transparency = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 0.3),
+            NumberSequenceKeypoint.new(0.5, 0.6),
+            NumberSequenceKeypoint.new(1, 1),
+        })
+        self.trail.WidthScale = NumberSequence.new({
+            NumberSequenceKeypoint.new(0, 1),
+            NumberSequenceKeypoint.new(0.8, 0.6),
+            NumberSequenceKeypoint.new(1, 0),
+        })
+        self.trail.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, CONFIG.Afterimage.Color),
+            ColorSequenceKeypoint.new(0.5, Color3.fromRGB(180, 120, 255)),
+            ColorSequenceKeypoint.new(1, CONFIG.Afterimage.Color),
+        })
+        self.trail.Enabled = true
+        self.trail.Parent = rootPart
+    end)
 end
 
 function AfterimageSystem:Stop()
-    for _, conn in ipairs(self.connections) do
-        conn:Disconnect()
-    end
-    self.connections = {}
-    for _, ghost in ipairs(self.active) do
-        if ghost and ghost.Parent then
-            ghost:Destroy()
+    safeCall(function()
+        if self.trail and self.trail.Parent then
+            self.trail.Enabled = false
+            self.trail:Clear()
+            self.trail:Destroy()
         end
-    end
-    self.active = {}
+        if self.attachment0 and self.attachment0.Parent then
+            self.attachment0:Destroy()
+        end
+        if self.attachment1 and self.attachment1.Parent then
+            self.attachment1:Destroy()
+        end
+    end)
+    self.trail = nil
+    self.attachment0 = nil
+    self.attachment1 = nil
 end
 
 ---------------------------------------------------------------------------
@@ -304,14 +241,12 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     billboard.LightInfluence = 0
     billboard.ClipsDescendants = false
 
-    -- 主卡片容器
     local card = Instance.new("Frame")
     card.Name = "Card"
     card.Size = UDim2.fromScale(1, 1)
     card.BackgroundTransparency = 1
     card.Parent = billboard
 
-    -- 背景面板
     local bg = Instance.new("Frame")
     bg.Name = "Background"
     bg.Size = UDim2.fromScale(1, 1)
@@ -330,7 +265,6 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     bgStroke.Transparency = 0.3
     bgStroke.Parent = bg
 
-    -- 顶部渐变条
     local topBar = Instance.new("Frame")
     topBar.Name = "TopBar"
     topBar.Size = UDim2.new(1, 0, 0, 3)
@@ -345,7 +279,6 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     })
     topGrad.Parent = topBar
 
-    -- 标题
     local titleLabel = Instance.new("TextLabel")
     titleLabel.Name = "Title"
     titleLabel.Size = UDim2.new(1, -16, 0, 24)
@@ -358,7 +291,6 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     titleLabel.TextXAlignment = Enum.TextXAlignment.Left
     titleLabel.Parent = bg
 
-    -- 分隔线
     local sep = Instance.new("Frame")
     sep.Name = "Separator"
     sep.Size = UDim2.new(1, -16, 0, 1)
@@ -368,7 +300,6 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     sep.BorderSizePixel = 0
     sep.Parent = bg
 
-    -- 数据区域
     local dataFrame = Instance.new("Frame")
     dataFrame.Name = "DataFrame"
     dataFrame.Size = UDim2.new(1, -16, 1, -50)
@@ -380,7 +311,6 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     listLayout.Padding = UDim.new(0, 4)
     listLayout.Parent = dataFrame
 
-    -- 填充数据
     for key, value in pairs(data) do
         local row = Instance.new("Frame")
         row.Name = "Row_" .. key
@@ -411,13 +341,14 @@ function InfoCardSystem:CreateCard(adornee, title, data)
         valueLabel.Parent = row
     end
 
-    -- 浮动动画
-    local floatTween = TweenService:Create(billboard, TweenInfo.new(
-        2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
-    ), {
-        StudsOffset = Vector3.new(0, 4.3, 0)
-    })
-    floatTween:Play()
+    safeCall(function()
+        local floatTween = TweenService:Create(billboard, TweenInfo.new(
+            2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
+        ), {
+            StudsOffset = Vector3.new(0, 4.3, 0)
+        })
+        floatTween:Play()
+    end)
 
     billboard.Parent = adornee
     return billboard
@@ -440,40 +371,41 @@ function InfoCardSystem:CreatePlayerCard(targetPlayer)
     local card = self:CreateCard(head, title, data)
     card.Name = "InfoCard_" .. targetPlayer.UserId
 
-    -- 实时更新数据
-    spawn(function()
+    task.spawn(function()
         while card and card.Parent do
-            local hrp = targetChar:FindFirstChild("HumanoidRootPart")
-            local hum = targetChar:FindFirstChild("Humanoid")
-            local myHrp = character:FindFirstChild("HumanoidRootPart")
+            safeCall(function()
+                local hrp = targetChar:FindFirstChild("HumanoidRootPart")
+                local hum = targetChar:FindFirstChild("Humanoid")
+                local myHrp = character and character:FindFirstChild("HumanoidRootPart")
 
-            if hrp and hum and myHrp then
-                local dist = math.floor((hrp.Position - myHrp.Position).Magnitude)
-                local health = math.floor(hum.Health)
-                local speed = math.floor(hum.WalkSpeed)
+                if hrp and hum and myHrp then
+                    local dist = math.floor((hrp.Position - myHrp.Position).Magnitude)
+                    local health = math.floor(hum.Health)
+                    local speed = math.floor(hum.WalkSpeed)
 
-                local dataFrame = card:FindFirstChild("Card", true)
-                    and card.Card:FindFirstChild("Background")
-                    and card.Card.Background:FindFirstChild("DataFrame")
+                    local dataFrame = card:FindFirstChild("Card", true)
+                        and card.Card:FindFirstChild("Background")
+                        and card.Card.Background:FindFirstChild("DataFrame")
 
-                if dataFrame then
-                    local healthRow = dataFrame:FindFirstChild("Row_生命值")
-                    if healthRow then
-                        local val = healthRow:FindFirstChild("Value")
-                        if val then val.Text = tostring(health) end
-                    end
-                    local speedRow = dataFrame:FindFirstChild("Row_速度")
-                    if speedRow then
-                        local val = speedRow:FindFirstChild("Value")
-                        if val then val.Text = tostring(speed) end
-                    end
-                    local distRow = dataFrame:FindFirstChild("Row_距离")
-                    if distRow then
-                        local val = distRow:FindFirstChild("Value")
-                        if val then val.Text = tostring(dist) end
+                    if dataFrame then
+                        local healthRow = dataFrame:FindFirstChild("Row_生命值")
+                        if healthRow then
+                            local val = healthRow:FindFirstChild("Value")
+                            if val then val.Text = tostring(health) end
+                        end
+                        local speedRow = dataFrame:FindFirstChild("Row_速度")
+                        if speedRow then
+                            local val = speedRow:FindFirstChild("Value")
+                            if val then val.Text = tostring(speed) end
+                        end
+                        local distRow = dataFrame:FindFirstChild("Row_距离")
+                        if distRow then
+                            local val = distRow:FindFirstChild("Value")
+                            if val then val.Text = tostring(dist) end
+                        end
                     end
                 end
-            end
+            end)
             RunService.Heartbeat:Wait()
         end
     end)
@@ -483,16 +415,14 @@ function InfoCardSystem:CreatePlayerCard(targetPlayer)
 end
 
 function InfoCardSystem:Start()
-    -- 为自己创建卡片
     if CONFIG.InfoCard.ShowOnSelf then
-        self:CreatePlayerCard(player)
+        safeCall(function() self:CreatePlayerCard(player) end)
     end
 
-    -- 为其他玩家创建卡片
     if CONFIG.InfoCard.ShowOnOthers then
         for _, otherPlayer in ipairs(Players:GetPlayers()) do
             if otherPlayer ~= player and otherPlayer.Character then
-                self:CreatePlayerCard(otherPlayer)
+                safeCall(function() self:CreatePlayerCard(otherPlayer) end)
             end
         end
 
@@ -500,7 +430,7 @@ function InfoCardSystem:Start()
             Players.PlayerAdded:Connect(function(newPlayer)
                 newPlayer.CharacterAdded:Connect(function()
                     task.wait(1)
-                    self:CreatePlayerCard(newPlayer)
+                    safeCall(function() self:CreatePlayerCard(newPlayer) end)
                 end)
             end)
         )
@@ -509,12 +439,12 @@ end
 
 function InfoCardSystem:Stop()
     for _, conn in ipairs(self.connections) do
-        conn:Disconnect()
+        pcall(function() conn:Disconnect() end)
     end
     for _, card in pairs(self.cards) do
-        if card and card.Parent then
-            card:Destroy()
-        end
+        pcall(function()
+            if card and card.Parent then card:Destroy() end
+        end)
     end
     self.cards = {}
     self.connections = {}
@@ -530,7 +460,6 @@ local function BuildMainUI()
     screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screenGui.IgnoreGuiInset = true
 
-    -- 全局模糊效果(仅用于UI)
     local uiBlur = Instance.new("BlurEffect")
     uiBlur.Name = "UIBlur"
     uiBlur.Size = 0
@@ -538,16 +467,108 @@ local function BuildMainUI()
     uiBlur.Parent = Lighting
 
     -----------------------------------------------------------------------
+    -- 手机端悬浮按钮
+    -----------------------------------------------------------------------
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "ToggleBtn"
+    toggleBtn.Size = UDim2.fromOffset(48, 48)
+    toggleBtn.Position = UDim2.new(0, 16, 0.5, -24)
+    toggleBtn.BackgroundColor3 = CONFIG.UI.CardColor
+    toggleBtn.BackgroundTransparency = 0.15
+    toggleBtn.Text = "V"
+    toggleBtn.TextColor3 = CONFIG.UI.AccentColor
+    toggleBtn.TextSize = 20
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.AutoButtonColor = false
+    toggleBtn.ZIndex = 100
+    toggleBtn.Parent = screenGui
+
+    local toggleCorner = Instance.new("UICorner")
+    toggleCorner.CornerRadius = UDim.new(1, 0)
+    toggleCorner.Parent = toggleBtn
+
+    local toggleStroke = Instance.new("UIStroke")
+    toggleStroke.Color = CONFIG.UI.AccentColor
+    toggleStroke.Thickness = 1.5
+    toggleStroke.Transparency = 0.3
+    toggleStroke.Parent = toggleBtn
+
+    local btnGlow = Instance.new("ImageLabel")
+    btnGlow.Name = "Glow"
+    btnGlow.Size = UDim2.fromOffset(80, 80)
+    btnGlow.Position = UDim2.fromScale(0.5, 0.5)
+    btnGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+    btnGlow.BackgroundTransparency = 1
+    btnGlow.Image = "rbxassetid://7669168585"
+    btnGlow.ImageColor3 = CONFIG.UI.AccentColor
+    btnGlow.ImageTransparency = 0.7
+    btnGlow.ScaleType = Enum.ScaleType.Slice
+    btnGlow.SliceCenter = Rect.new(40, 40, 360, 360)
+    btnGlow.ZIndex = 99
+    btnGlow.Parent = toggleBtn
+
+    task.spawn(function()
+        while toggleBtn and toggleBtn.Parent do
+            safeCall(function()
+                TweenService:Create(btnGlow, TweenInfo.new(
+                    1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
+                ), {
+                    ImageTransparency = 0.9,
+                }):Play()
+            end)
+            task.wait(3)
+        end
+    end)
+
+    -- 按钮拖拽
+    local btnDragging = false
+    local btnDragStart, btnStartPos
+    local btnDragMoved = false
+
+    toggleBtn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            btnDragging = true
+            btnDragMoved = false
+            btnDragStart = input.Position
+            btnStartPos = toggleBtn.Position
+        end
+    end)
+
+    toggleBtn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            btnDragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(input)
+        if btnDragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - btnDragStart
+            if delta.Magnitude > 8 then
+                btnDragMoved = true
+            end
+            toggleBtn.Position = UDim2.new(
+                btnStartPos.X.Scale, btnStartPos.X.Offset + delta.X,
+                btnStartPos.Y.Scale, btnStartPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -----------------------------------------------------------------------
     -- 侧边栏面板
     -----------------------------------------------------------------------
     local panel = Instance.new("Frame")
     panel.Name = "SidePanel"
-    panel.Size = UDim2.new(0, 300, 0, 480)
-    panel.Position = UDim2.new(0, 20, 0.5, -240)
+    panel.Size = UDim2.new(0, 280, 0, 460)
+    panel.Position = UDim2.new(0, 72, 0.5, -230)
     panel.BackgroundColor3 = CONFIG.UI.BackgroundColor
     panel.BackgroundTransparency = 0.08
     panel.BorderSizePixel = 0
     panel.ClipsDescendants = true
+    panel.Visible = false
     panel.Parent = screenGui
 
     local panelCorner = Instance.new("UICorner")
@@ -560,7 +581,6 @@ local function BuildMainUI()
     panelStroke.Transparency = 0.3
     panelStroke.Parent = panel
 
-    -- 面板发光
     AcrylicPure.CreateGlow(panel, CONFIG.UI.AccentColor, 350)
 
     -- 顶部标题区域
@@ -603,12 +623,9 @@ local function BuildMainUI()
     subtitle.TextXAlignment = Enum.TextXAlignment.Left
     subtitle.Parent = header
 
-    -- 渐变分隔线
     AcrylicPure.CreateAccentLine(panel, UDim2.new(0, 12, 0, 56), UDim2.new(1, -24, 0, 1))
 
-    -----------------------------------------------------------------------
     -- 功能列表区域
-    -----------------------------------------------------------------------
     local scrollFrame = Instance.new("ScrollingFrame")
     scrollFrame.Name = "FeatureList"
     scrollFrame.Size = UDim2.new(1, -16, 1, -80)
@@ -656,7 +673,6 @@ local function BuildMainUI()
         cardStroke.Transparency = 0.5
         cardStroke.Parent = card
 
-        -- 功能名称
         local nameLabel = Instance.new("TextLabel")
         nameLabel.Size = UDim2.new(1, -80, 0, 16)
         nameLabel.Position = UDim2.new(0, 12, 0, 8)
@@ -668,7 +684,6 @@ local function BuildMainUI()
         nameLabel.TextXAlignment = Enum.TextXAlignment.Left
         nameLabel.Parent = card
 
-        -- 描述
         local descLabel = Instance.new("TextLabel")
         descLabel.Size = UDim2.new(1, -80, 0, 14)
         descLabel.Position = UDim2.new(0, 12, 0, 28)
@@ -680,36 +695,33 @@ local function BuildMainUI()
         descLabel.TextXAlignment = Enum.TextXAlignment.Left
         descLabel.Parent = card
 
-        -- 开关按钮
-        local toggleBtn = Instance.new("TextButton")
-        toggleBtn.Name = "Toggle"
-        toggleBtn.Size = UDim2.fromOffset(44, 24)
-        toggleBtn.Position = UDim2.new(1, -56, 0.5, -12)
-        toggleBtn.BackgroundColor3 = defaultState and CONFIG.UI.SuccessColor or CONFIG.UI.BorderColor
-        toggleBtn.BackgroundTransparency = 0.2
-        toggleBtn.Text = ""
-        toggleBtn.BorderSizePixel = 0
-        toggleBtn.AutoButtonColor = false
-        toggleBtn.Parent = card
+        local swBtn = Instance.new("TextButton")
+        swBtn.Name = "Toggle"
+        swBtn.Size = UDim2.fromOffset(44, 24)
+        swBtn.Position = UDim2.new(1, -56, 0.5, -12)
+        swBtn.BackgroundColor3 = defaultState and CONFIG.UI.SuccessColor or CONFIG.UI.BorderColor
+        swBtn.BackgroundTransparency = 0.2
+        swBtn.Text = ""
+        swBtn.BorderSizePixel = 0
+        swBtn.AutoButtonColor = false
+        swBtn.Parent = card
 
-        local toggleCorner = Instance.new("UICorner")
-        toggleCorner.CornerRadius = UDim.new(1, 0)
-        toggleCorner.Parent = toggleBtn
+        local swCorner = Instance.new("UICorner")
+        swCorner.CornerRadius = UDim.new(1, 0)
+        swCorner.Parent = swBtn
 
-        -- 开关圆点
         local knob = Instance.new("Frame")
         knob.Name = "Knob"
         knob.Size = UDim2.fromOffset(18, 18)
         knob.Position = defaultState and UDim2.new(1, -21, 0.5, -9) or UDim2.new(0, 3, 0.5, -9)
         knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
         knob.BorderSizePixel = 0
-        knob.Parent = toggleBtn
+        knob.Parent = swBtn
 
         local knobCorner = Instance.new("UICorner")
         knobCorner.CornerRadius = UDim.new(1, 0)
         knobCorner.Parent = knob
 
-        -- 状态指示灯
         local indicator = Instance.new("Frame")
         indicator.Name = "Indicator"
         indicator.Size = UDim2.fromOffset(6, 6)
@@ -722,28 +734,22 @@ local function BuildMainUI()
         indCorner.CornerRadius = UDim.new(1, 0)
         indCorner.Parent = indicator
 
-        -- 开关交互
         local isOn = defaultState
-        toggleBtn.MouseButton1Click:Connect(function()
+        swBtn.MouseButton1Click:Connect(function()
             isOn = not isOn
-
-            -- 动画切换
             local targetPos = isOn and UDim2.new(1, -21, 0.5, -9) or UDim2.new(0, 3, 0.5, -9)
             local targetColor = isOn and CONFIG.UI.SuccessColor or CONFIG.UI.BorderColor
 
             TweenService:Create(knob, TweenInfo.new(0.25, Enum.EasingStyle.Back), {
                 Position = targetPos
             }):Play()
-
-            TweenService:Create(toggleBtn, TweenInfo.new(0.25), {
+            TweenService:Create(swBtn, TweenInfo.new(0.25), {
                 BackgroundColor3 = targetColor
             }):Play()
-
             TweenService:Create(indicator, TweenInfo.new(0.25), {
                 BackgroundColor3 = isOn and CONFIG.UI.SuccessColor or CONFIG.UI.DangerColor
             }):Play()
 
-            -- 触发功能回调
             FeatureInterface:Toggle(featureName)
         end)
 
@@ -751,7 +757,7 @@ local function BuildMainUI()
     end
 
     -----------------------------------------------------------------------
-    -- 注册所有功能
+    -- 注册功能
     -----------------------------------------------------------------------
     FeatureInterface:Register("移动残影", CONFIG.Afterimage.Enabled, function(state)
         CONFIG.Afterimage.Enabled = state
@@ -773,12 +779,13 @@ local function BuildMainUI()
 
     FeatureInterface:Register("高亮玩家", false, function(state)
         for _, p in ipairs(Players:GetPlayers()) do
-            if p.Character then
-                local highlight = p.Character:FindFirstChild("Highlight")
+            safeCall(function()
+                if not p.Character then return end
+                local highlight = p.Character:FindFirstChild("AcrylicHighlight")
                 if state then
                     if not highlight then
                         highlight = Instance.new("Highlight")
-                        highlight.Name = "Highlight"
+                        highlight.Name = "AcrylicHighlight"
                         highlight.FillColor = CONFIG.UI.AccentColor
                         highlight.FillTransparency = 0.7
                         highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
@@ -786,88 +793,90 @@ local function BuildMainUI()
                         highlight.Parent = p.Character
                     end
                 else
-                    if highlight then
-                        highlight:Destroy()
-                    end
+                    if highlight then highlight:Destroy() end
                 end
-            end
+            end)
         end
     end)
 
     FeatureInterface:Register("ESP线框", false, function(state)
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= player and p.Character then
-                local espBox = p.Character:FindFirstChild("ESPBox")
+            safeCall(function()
+                if p == player then return end
+                if not p.Character then return end
+                local espBox = p.Character:FindFirstChild("AcrylicESP")
                 if state then
                     if not espBox then
-                        local box = Instance.new("BoxHandleAdornment")
-                        box.Name = "ESPBox"
-                        box.Adornee = p.Character
-                        box.Size = Vector3.new(4, 5.5, 4)
-                        box.Color3 = CONFIG.UI.AccentColor
-                        box.Transparency = 0.6
-                        box.AlwaysOnTop = true
-                        box.ZIndex = 10
-                        box.Parent = p.Character
+                        espBox = Instance.new("BoxHandleAdornment")
+                        espBox.Name = "AcrylicESP"
+                        espBox.Adornee = p.Character:FindFirstChild("HumanoidRootPart") or p.Character
+                        espBox.Size = Vector3.new(4, 5.5, 4)
+                        espBox.Color3 = CONFIG.UI.AccentColor
+                        espBox.Transparency = 0.6
+                        espBox.AlwaysOnTop = true
+                        espBox.ZIndex = 10
+                        espBox.Parent = p.Character
                     end
                 else
-                    if espBox then
-                        espBox:Destroy()
-                    end
+                    if espBox then espBox:Destroy() end
                 end
-            end
+            end)
         end
     end)
 
     FeatureInterface:Register("全屏模糊", false, function(state)
-        uiBlur.Size = state and 20 or 0
+        safeCall(function()
+            uiBlur.Size = state and 20 or 0
+        end)
     end)
 
     FeatureInterface:Register("FPS显示", false, function(state)
-        local fpsLabel = screenGui:FindFirstChild("FPSLabel")
-        if state then
-            if not fpsLabel then
-                fpsLabel = Instance.new("TextLabel")
-                fpsLabel.Name = "FPSLabel"
-                fpsLabel.Size = UDim2.new(0, 100, 0, 30)
-                fpsLabel.Position = UDim2.new(1, -120, 0, 10)
-                fpsLabel.BackgroundColor3 = CONFIG.UI.CardColor
-                fpsLabel.BackgroundTransparency = 0.2
-                fpsLabel.TextColor3 = CONFIG.UI.SuccessColor
-                fpsLabel.TextSize = 14
-                fpsLabel.Font = Enum.Font.GothamBold
-                fpsLabel.BorderSizePixel = 0
-                fpsLabel.Parent = screenGui
+        safeCall(function()
+            local fpsLabel = screenGui:FindFirstChild("FPSLabel")
+            if state then
+                if not fpsLabel then
+                    fpsLabel = Instance.new("TextLabel")
+                    fpsLabel.Name = "FPSLabel"
+                    fpsLabel.Size = UDim2.new(0, 100, 0, 30)
+                    fpsLabel.Position = UDim2.new(1, -120, 0, 10)
+                    fpsLabel.BackgroundColor3 = CONFIG.UI.CardColor
+                    fpsLabel.BackgroundTransparency = 0.2
+                    fpsLabel.TextColor3 = CONFIG.UI.SuccessColor
+                    fpsLabel.TextSize = 14
+                    fpsLabel.Font = Enum.Font.GothamBold
+                    fpsLabel.BorderSizePixel = 0
+                    fpsLabel.Parent = screenGui
 
-                local fpsCorner = Instance.new("UICorner")
-                fpsCorner.CornerRadius = UDim.new(0, 8)
-                fpsCorner.Parent = fpsLabel
+                    local fpsCorner = Instance.new("UICorner")
+                    fpsCorner.CornerRadius = UDim.new(0, 8)
+                    fpsCorner.Parent = fpsLabel
 
-                local fpsStroke = Instance.new("UIStroke")
-                fpsStroke.Color = CONFIG.UI.BorderColor
-                fpsStroke.Thickness = 0.5
-                fpsStroke.Transparency = 0.5
-                fpsStroke.Parent = fpsLabel
+                    local fpsStroke = Instance.new("UIStroke")
+                    fpsStroke.Color = CONFIG.UI.BorderColor
+                    fpsStroke.Thickness = 0.5
+                    fpsStroke.Transparency = 0.5
+                    fpsStroke.Parent = fpsLabel
 
-                spawn(function()
-                    local lastTick = tick()
-                    local frames = 0
-                    while fpsLabel and fpsLabel.Parent do
-                        frames = frames + 1
-                        if tick() - lastTick >= 1 then
-                            fpsLabel.Text = "FPS: " .. tostring(frames)
-                            frames = 0
-                            lastTick = tick()
+                    task.spawn(function()
+                        local lastTick = tick()
+                        local frames = 0
+                        while fpsLabel and fpsLabel.Parent do
+                            frames = frames + 1
+                            if tick() - lastTick >= 1 then
+                                safeCall(function()
+                                    fpsLabel.Text = "FPS: " .. tostring(frames)
+                                end)
+                                frames = 0
+                                lastTick = tick()
+                            end
+                            RunService.Heartbeat:Wait()
                         end
-                        RunService.Heartbeat:Wait()
-                    end
-                end)
+                    end)
+                end
+            else
+                if fpsLabel then fpsLabel:Destroy() end
             end
-        else
-            if fpsLabel then
-                fpsLabel:Destroy()
-            end
-        end
+        end)
     end)
 
     -----------------------------------------------------------------------
@@ -892,15 +901,11 @@ local function BuildMainUI()
     footer.BorderSizePixel = 0
     footer.Parent = panel
 
-    local footerCorner = Instance.new("UICorner")
-    footerCorner.CornerRadius = UDim.new(0, 0)
-    footerCorner.Parent = footer
-
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Size = UDim2.new(1, -16, 1, 0)
     statusLabel.Position = UDim2.new(0, 8, 0, 0)
     statusLabel.BackgroundTransparency = 1
-    statusLabel.Text = "● 已连接 | " .. Players:GetPlayers()[1].Name
+    statusLabel.Text = "● 已连接"
     statusLabel.TextColor3 = CONFIG.UI.SuccessColor
     statusLabel.TextSize = 10
     statusLabel.Font = Enum.Font.Gotham
@@ -908,13 +913,14 @@ local function BuildMainUI()
     statusLabel.Parent = footer
 
     -----------------------------------------------------------------------
-    -- 面板拖拽功能
+    -- 面板拖拽
     -----------------------------------------------------------------------
     local dragging = false
     local dragStart, startPos
 
     header.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
             startPos = panel.Position
@@ -922,13 +928,15 @@ local function BuildMainUI()
     end)
 
     header.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
             dragging = false
         end
     end)
 
     UserInputService.InputChanged:Connect(function(input)
-        if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
             panel.Position = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + delta.X,
@@ -938,34 +946,64 @@ local function BuildMainUI()
     end)
 
     -----------------------------------------------------------------------
-    -- 快捷键: RightCtrl 切换面板显隐
+    -- 悬浮按钮控制面板显隐
     -----------------------------------------------------------------------
-    local panelVisible = true
-    UserInputService.InputBegan:Connect(function(input, gpe)
-        if gpe then return end
-        if input.KeyCode == Enum.KeyCode.RightControl then
-            panelVisible = not panelVisible
-            local targetSize = panelVisible and UDim2.new(0, 300, 0, 480) or UDim2.new(0, 300, 0, 0)
-            local targetTrans = panelVisible and 0.08 or 1
-            TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Back), {
-                Size = targetSize,
-                BackgroundTransparency = targetTrans,
+    local panelVisible = false
+
+    local function togglePanel()
+        panelVisible = not panelVisible
+
+        if panelVisible then
+            panel.Visible = true
+            panel.Size = UDim2.new(0, 280, 0, 0)
+            panel.BackgroundTransparency = 1
+            TweenService:Create(panel, TweenInfo.new(0.4, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+                Size = UDim2.new(0, 280, 0, 460),
+                BackgroundTransparency = 0.08,
             }):Play()
+
+            TweenService:Create(toggleBtn, TweenInfo.new(0.25), {
+                BackgroundColor3 = CONFIG.UI.AccentColor,
+            }):Play()
+            TweenService:Create(toggleStroke, TweenInfo.new(0.25), {
+                Transparency = 0,
+            }):Play()
+            toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        else
+            local tween = TweenService:Create(panel, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.In), {
+                Size = UDim2.new(0, 280, 0, 0),
+                BackgroundTransparency = 1,
+            })
+            tween:Play()
+            tween.Completed:Connect(function()
+                if not panelVisible then
+                    panel.Visible = false
+                end
+            end)
+
+            TweenService:Create(toggleBtn, TweenInfo.new(0.25), {
+                BackgroundColor3 = CONFIG.UI.CardColor,
+            }):Play()
+            TweenService:Create(toggleStroke, TweenInfo.new(0.25), {
+                Transparency = 0.3,
+            }):Play()
+            toggleBtn.TextColor3 = CONFIG.UI.AccentColor
+        end
+    end
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        if not btnDragMoved then
+            togglePanel()
         end
     end)
 
-    -----------------------------------------------------------------------
-    -- 面板入场动画
-    -----------------------------------------------------------------------
-    panel.Size = UDim2.new(0, 300, 0, 0)
-    panel.BackgroundTransparency = 1
-    panel.ClipsDescendants = true
-
-    task.wait(0.5)
-    TweenService:Create(panel, TweenInfo.new(0.6, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-        Size = UDim2.new(0, 300, 0, 480),
-        BackgroundTransparency = 0.08,
-    }):Play()
+    -- PC端也保留键盘快捷键
+    UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.KeyCode == Enum.KeyCode.RightControl then
+            togglePanel()
+        end
+    end)
 
     screenGui.Parent = player:WaitForChild("PlayerGui")
     return screenGui
@@ -979,16 +1017,15 @@ player.CharacterAdded:Connect(function(newChar)
     humanoid = newChar:WaitForChild("Humanoid")
     rootPart = newChar:WaitForChild("HumanoidRootPart")
 
-    -- 重新启动残影系统
     if CONFIG.Afterimage.Enabled then
+        task.wait(0.5)
         AfterimageSystem:Stop()
         AfterimageSystem:Start()
     end
 
-    -- 重新创建自己的信息卡片
     if CONFIG.InfoCard.Enabled and CONFIG.InfoCard.ShowOnSelf then
         task.wait(1)
-        InfoCardSystem:CreatePlayerCard(player)
+        safeCall(function() InfoCardSystem:CreatePlayerCard(player) end)
     end
 end)
 
@@ -997,7 +1034,6 @@ end)
 ---------------------------------------------------------------------------
 local mainUI = BuildMainUI()
 
--- 启动默认开启的功能
 if CONFIG.Afterimage.Enabled then
     AfterimageSystem:Start()
 end
@@ -1006,4 +1042,4 @@ if CONFIG.InfoCard.Enabled then
     InfoCardSystem:Start()
 end
 
-print("[Acrylic Pure] 视觉脚本已加载")
+print("[Acrylic Pure] 视觉脚本已加载 v2")
