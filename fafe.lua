@@ -1,13 +1,19 @@
 --[[
-    Roblox Visual Script - Acrylic Pure Edition v2
+    Roblox Visual Script - Acrylic Pure Edition v2.1 (Bug Fixed)
     Features:
       - Acrylic Pure 风格 UI (毛玻璃/亚克力透明质感)
       - Feature Interface 面板 (功能开关列表)
       - 3D 信息卡片 (BillboardGui)
       - 移动残影效果 (Trail)
       - 手机端悬浮按钮
-
-    放置位置: StarterPlayerScripts 或 StarterGui (LocalScript)
+    
+    修复内容:
+      - 修复信息卡片健康值显示错误
+      - 修复高亮/ESP对新玩家无效
+      - 修复角色重生时的组件获取问题
+      - 修复内存泄漏
+      - 添加UI边界检查
+      - 优化协程安全性
 --]]
 
 local Players = game:GetService("Players")
@@ -15,6 +21,7 @@ local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Lighting = game:GetService("Lighting")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
@@ -27,10 +34,8 @@ local rootPart = character:WaitForChild("HumanoidRootPart")
 local CONFIG = {
     Afterimage = {
         Enabled = true,
-        TrailLength = 0.8,
-        TrailWidth = 1.2,
-        Color = Color3.fromRGB(120, 180, 255),
         Lifetime = 0.5,
+        Color = Color3.fromRGB(120, 180, 255),
     },
 
     InfoCard = {
@@ -62,6 +67,24 @@ local function safeCall(fn, ...)
         warn("[Acrylic Pure] " .. tostring(err))
     end
     return ok
+end
+
+local function isDescendant(obj, parent)
+    return obj and obj:IsDescendantOf(parent)
+end
+
+local function clampUdim2(pos, size, screenSize)
+    local maxXScale = 1 - size.X.Scale
+    local maxYScale = 1 - size.Y.Scale
+    local maxXOffset = screenSize.X - size.X.Offset
+    local maxYOffset = screenSize.Y - size.Y.Offset
+    
+    return UDim2.new(
+        math.clamp(pos.X.Scale, 0, maxXScale),
+        math.clamp(pos.X.Offset, 0, maxXOffset),
+        math.clamp(pos.Y.Scale, 0, maxYScale),
+        math.clamp(pos.Y.Offset, 0, maxYOffset)
+    )
 end
 
 ---------------------------------------------------------------------------
@@ -116,6 +139,7 @@ end
 ---------------------------------------------------------------------------
 local FeatureInterface = {}
 FeatureInterface.Features = {}
+FeatureInterface.Connections = {}
 
 function FeatureInterface:Register(name, defaultState, callback)
     self.Features[name] = {
@@ -142,28 +166,39 @@ end
 function FeatureInterface:Toggle(name)
     local feature = self.Features[name]
     if feature then
-        self:Set(name, not feature.State)
-        return not feature.State
+        local newState = not feature.State
+        self:Set(name, newState)
+        return newState
     end
     return nil
 end
 
+function FeatureInterface:Cleanup()
+    for _, conn in ipairs(self.Connections) do
+        safeCall(function() conn:Disconnect() end)
+    end
+    self.Connections = {}
+end
+
 ---------------------------------------------------------------------------
--- 残影系统 (使用 Trail 对象，更稳定)
+-- 残影系统 (Trail)
 ---------------------------------------------------------------------------
 local AfterimageSystem = {
     trail = nil,
     attachment0 = nil,
     attachment1 = nil,
-    connections = {},
+    isActive = false,
 }
 
 function AfterimageSystem:Start()
     self:Stop()
+    
+    if not rootPart or not rootPart.Parent then
+        warn("[Afterimage] rootPart not ready")
+        return false
+    end
 
-    if not rootPart or not rootPart.Parent then return end
-
-    safeCall(function()
+    local success = safeCall(function()
         self.attachment0 = Instance.new("Attachment")
         self.attachment0.Name = "TrailTop"
         self.attachment0.Position = Vector3.new(0, 2, 0)
@@ -200,15 +235,20 @@ function AfterimageSystem:Start()
         })
         self.trail.Enabled = true
         self.trail.Parent = rootPart
+        self.isActive = true
     end)
+    
+    return success
 end
 
 function AfterimageSystem:Stop()
     safeCall(function()
-        if self.trail and self.trail.Parent then
+        if self.trail then
             self.trail.Enabled = false
-            self.trail:Clear()
-            self.trail:Destroy()
+            if self.trail.Parent then
+                self.trail:Clear()
+                self.trail:Destroy()
+            end
         end
         if self.attachment0 and self.attachment0.Parent then
             self.attachment0:Destroy()
@@ -220,6 +260,15 @@ function AfterimageSystem:Stop()
     self.trail = nil
     self.attachment0 = nil
     self.attachment1 = nil
+    self.isActive = false
+end
+
+function AfterimageSystem:Restart()
+    if self.isActive then
+        self:Stop()
+        task.wait(0.1)
+        self:Start()
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -228,6 +277,8 @@ end
 local InfoCardSystem = {
     cards = {},
     connections = {},
+    playerAddedConn = nil,
+    playerRemovingConn = nil,
 }
 
 function InfoCardSystem:CreateCard(adornee, title, data)
@@ -311,6 +362,8 @@ function InfoCardSystem:CreateCard(adornee, title, data)
     listLayout.Padding = UDim.new(0, 4)
     listLayout.Parent = dataFrame
 
+    -- 动态创建数据行
+    local rows = {}
     for key, value in pairs(data) do
         local row = Instance.new("Frame")
         row.Name = "Row_" .. key
@@ -339,82 +392,103 @@ function InfoCardSystem:CreateCard(adornee, title, data)
         valueLabel.Font = Enum.Font.GothamMedium
         valueLabel.TextXAlignment = Enum.TextXAlignment.Right
         valueLabel.Parent = row
+        
+        rows[key] = valueLabel
     end
 
     safeCall(function()
-        local floatTween = TweenService:Create(billboard, TweenInfo.new(
+        TweenService:Create(billboard, TweenInfo.new(
             2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
         ), {
             StudsOffset = Vector3.new(0, 4.3, 0)
-        })
-        floatTween:Play()
+        }):Play()
     end)
 
     billboard.Parent = adornee
-    return billboard
+    return billboard, rows
 end
 
 function InfoCardSystem:CreatePlayerCard(targetPlayer)
     local targetChar = targetPlayer.Character
     if not targetChar then return end
+    
     local head = targetChar:FindFirstChild("Head")
     if not head then return end
+    
+    -- 如果已存在卡片，先清理
+    local existingCard = self.cards[targetPlayer.UserId]
+    if existingCard and existingCard.Parent then
+        existingCard:Destroy()
+    end
 
     local title = targetPlayer.DisplayName
     local data = {
         ["用户名"] = "@" .. targetPlayer.Name,
-        ["生命值"] = "100",
-        ["速度"] = "16",
+        ["生命值"] = "??",
+        ["速度"] = "??",
         ["距离"] = "0",
     }
 
-    local card = self:CreateCard(head, title, data)
+    local card, rows = self:CreateCard(head, title, data)
     card.Name = "InfoCard_" .. targetPlayer.UserId
+    self.cards[targetPlayer.UserId] = card
 
-    task.spawn(function()
-        while card and card.Parent do
+    -- 存储 rows 引用以便更新
+    self.cards[targetPlayer.UserId .. "_rows"] = rows
+
+    -- 更新数据的协程
+    local updateCoroutine
+    updateCoroutine = task.spawn(function()
+        while card and card.Parent and isDescendant(card, game) do
             safeCall(function()
-                local hrp = targetChar:FindFirstChild("HumanoidRootPart")
-                local hum = targetChar:FindFirstChild("Humanoid")
+                local currentChar = targetPlayer.Character
+                if not currentChar then break end
+                
+                local hrp = currentChar:FindFirstChild("HumanoidRootPart")
+                local hum = currentChar:FindFirstChild("Humanoid")
                 local myHrp = character and character:FindFirstChild("HumanoidRootPart")
 
-                if hrp and hum and myHrp then
+                if hrp and hum and myHrp and rows then
                     local dist = math.floor((hrp.Position - myHrp.Position).Magnitude)
                     local health = math.floor(hum.Health)
                     local speed = math.floor(hum.WalkSpeed)
 
-                    local dataFrame = card:FindFirstChild("Card", true)
-                        and card.Card:FindFirstChild("Background")
-                        and card.Card.Background:FindFirstChild("DataFrame")
-
-                    if dataFrame then
-                        local healthRow = dataFrame:FindFirstChild("Row_生命值")
-                        if healthRow then
-                            local val = healthRow:FindFirstChild("Value")
-                            if val then val.Text = tostring(health) end
-                        end
-                        local speedRow = dataFrame:FindFirstChild("Row_速度")
-                        if speedRow then
-                            local val = speedRow:FindFirstChild("Value")
-                            if val then val.Text = tostring(speed) end
-                        end
-                        local distRow = dataFrame:FindFirstChild("Row_距离")
-                        if distRow then
-                            local val = distRow:FindFirstChild("Value")
-                            if val then val.Text = tostring(dist) end
-                        end
-                    end
+                    if rows["生命值"] then rows["生命值"].Text = tostring(health) end
+                    if rows["速度"] then rows["速度"].Text = tostring(speed) end
+                    if rows["距离"] then rows["距离"].Text = tostring(dist) end
                 end
             end)
             RunService.Heartbeat:Wait()
         end
     end)
-
-    self.cards[targetPlayer.UserId] = card
+    
+    -- 存储协程引用以便清理
+    self.cards[targetPlayer.UserId .. "_coroutine"] = updateCoroutine
+    
     return card
 end
 
+function InfoCardSystem:RemovePlayerCard(targetPlayer)
+    local userId = targetPlayer.UserId
+    local card = self.cards[userId]
+    if card then
+        safeCall(function() card:Destroy() end)
+        self.cards[userId] = nil
+    end
+    
+    local coroutineRef = self.cards[userId .. "_coroutine"]
+    if coroutineRef then
+        -- 协程会在下一次心跳时自然结束，无法强制停止，但引用可被GC
+        self.cards[userId .. "_coroutine"] = nil
+    end
+    
+    self.cards[userId .. "_rows"] = nil
+end
+
 function InfoCardSystem:Start()
+    -- 清理旧数据
+    self:Stop()
+    
     if CONFIG.InfoCard.ShowOnSelf then
         safeCall(function() self:CreatePlayerCard(player) end)
     end
@@ -426,28 +500,240 @@ function InfoCardSystem:Start()
             end
         end
 
-        table.insert(self.connections,
-            Players.PlayerAdded:Connect(function(newPlayer)
-                newPlayer.CharacterAdded:Connect(function()
-                    task.wait(1)
-                    safeCall(function() self:CreatePlayerCard(newPlayer) end)
-                end)
-            end)
-        )
+        self.playerAddedConn = Players.PlayerAdded:Connect(function(newPlayer)
+            -- 延迟等待角色加载
+            task.wait(1)
+            if newPlayer ~= player then
+                safeCall(function() self:CreatePlayerCard(newPlayer) end)
+            end
+        end)
+        
+        self.playerRemovingConn = Players.PlayerRemoving:Connect(function(leavingPlayer)
+            if leavingPlayer ~= player then
+                self:RemovePlayerCard(leavingPlayer)
+            end
+        end)
+        
+        table.insert(self.connections, self.playerAddedConn)
+        table.insert(self.connections, self.playerRemovingConn)
     end
 end
 
 function InfoCardSystem:Stop()
     for _, conn in ipairs(self.connections) do
-        pcall(function() conn:Disconnect() end)
+        safeCall(function() conn:Disconnect() end)
     end
-    for _, card in pairs(self.cards) do
-        pcall(function()
-            if card and card.Parent then card:Destroy() end
-        end)
+    for userId, card in pairs(self.cards) do
+        if type(userId) == "number" then
+            safeCall(function()
+                if card and card.Parent then card:Destroy() end
+            end)
+        end
     end
     self.cards = {}
     self.connections = {}
+    self.playerAddedConn = nil
+    self.playerRemovingConn = nil
+end
+
+function InfoCardSystem:Restart()
+    if CONFIG.InfoCard.Enabled then
+        self:Stop()
+        task.wait(0.1)
+        self:Start()
+    end
+end
+
+---------------------------------------------------------------------------
+-- 高亮系统 (独立管理)
+---------------------------------------------------------------------------
+local HighlightSystem = {
+    isActive = false,
+    connections = {},
+    highlights = {},
+}
+
+function HighlightSystem:ApplyHighlight(targetPlayer)
+    local char = targetPlayer.Character
+    if not char then return end
+    
+    local highlight = char:FindFirstChild("AcrylicHighlight")
+    if not highlight then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "AcrylicHighlight"
+        highlight.FillColor = CONFIG.UI.AccentColor
+        highlight.FillTransparency = 0.7
+        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+        highlight.OutlineTransparency = 0.3
+        highlight.Parent = char
+        self.highlights[targetPlayer.UserId] = highlight
+    end
+end
+
+function HighlightSystem:RemoveHighlight(targetPlayer)
+    local userId = targetPlayer.UserId
+    local highlight = self.highlights[userId]
+    if highlight then
+        safeCall(function() highlight:Destroy() end)
+        self.highlights[userId] = nil
+    end
+    
+    -- 也检查角色上可能残留的
+    if targetPlayer.Character then
+        local existing = targetPlayer.Character:FindFirstChild("AcrylicHighlight")
+        if existing then existing:Destroy() end
+    end
+end
+
+function HighlightSystem:Start()
+    if self.isActive then return end
+    
+    local function onCharacterAdded(targetPlayer)
+        return function(char)
+            -- 延迟等待角色完全加载
+            task.wait(0.5)
+            if self.isActive and targetPlayer ~= player then
+                self:ApplyHighlight(targetPlayer)
+            end
+        end
+    end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            self:ApplyHighlight(p)
+            -- 监听角色重生
+            local conn = p.CharacterAdded:Connect(onCharacterAdded(p))
+            table.insert(self.connections, conn)
+        end
+    end
+    
+    -- 监听新玩家
+    local playerAddedConn = Players.PlayerAdded:Connect(function(newPlayer)
+        if newPlayer ~= player then
+            task.wait(0.5)
+            self:ApplyHighlight(newPlayer)
+            local conn = newPlayer.CharacterAdded:Connect(onCharacterAdded(newPlayer))
+            table.insert(self.connections, conn)
+        end
+    end)
+    table.insert(self.connections, playerAddedConn)
+    
+    self.isActive = true
+end
+
+function HighlightSystem:Stop()
+    for _, p in ipairs(Players:GetPlayers()) do
+        self:RemoveHighlight(p)
+    end
+    for _, conn in ipairs(self.connections) do
+        safeCall(function() conn:Disconnect() end)
+    end
+    self.connections = {}
+    self.highlights = {}
+    self.isActive = false
+end
+
+function HighlightSystem:Restart()
+    if self.isActive then
+        self:Stop()
+        task.wait(0.1)
+        self:Start()
+    end
+end
+
+---------------------------------------------------------------------------
+-- ESP 线框系统
+---------------------------------------------------------------------------
+local ESPSystem = {
+    isActive = false,
+    connections = {},
+    espBoxes = {},
+}
+
+function ESPSystem:ApplyESP(targetPlayer)
+    if targetPlayer == player then return end
+    
+    local char = targetPlayer.Character
+    if not char then return end
+    
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    
+    local espBox = hrp:FindFirstChild("AcrylicESP")
+    if not espBox then
+        espBox = Instance.new("BoxHandleAdornment")
+        espBox.Name = "AcrylicESP"
+        espBox.Adornee = hrp
+        espBox.Size = Vector3.new(4, 5.5, 4)
+        espBox.Color3 = CONFIG.UI.AccentColor
+        espBox.Transparency = 0.6
+        espBox.AlwaysOnTop = true
+        espBox.ZIndex = 10
+        espBox.Parent = hrp
+        self.espBoxes[targetPlayer.UserId] = espBox
+    end
+end
+
+function ESPSystem:RemoveESP(targetPlayer)
+    local userId = targetPlayer.UserId
+    local espBox = self.espBoxes[userId]
+    if espBox then
+        safeCall(function() espBox:Destroy() end)
+        self.espBoxes[userId] = nil
+    end
+end
+
+function ESPSystem:Start()
+    if self.isActive then return end
+    
+    local function onCharacterAdded(targetPlayer)
+        return function(char)
+            task.wait(0.5)
+            if self.isActive then
+                self:ApplyESP(targetPlayer)
+            end
+        end
+    end
+    
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            self:ApplyESP(p)
+            local conn = p.CharacterAdded:Connect(onCharacterAdded(p))
+            table.insert(self.connections, conn)
+        end
+    end
+    
+    local playerAddedConn = Players.PlayerAdded:Connect(function(newPlayer)
+        if newPlayer ~= player then
+            task.wait(0.5)
+            self:ApplyESP(newPlayer)
+            local conn = newPlayer.CharacterAdded:Connect(onCharacterAdded(newPlayer))
+            table.insert(self.connections, conn)
+        end
+    end)
+    table.insert(self.connections, playerAddedConn)
+    
+    self.isActive = true
+end
+
+function ESPSystem:Stop()
+    for _, p in ipairs(Players:GetPlayers()) do
+        self:RemoveESP(p)
+    end
+    for _, conn in ipairs(self.connections) do
+        safeCall(function() conn:Disconnect() end)
+    end
+    self.connections = {}
+    self.espBoxes = {}
+    self.isActive = false
+end
+
+function ESPSystem:Restart()
+    if self.isActive then
+        self:Stop()
+        task.wait(0.1)
+        self:Start()
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -508,20 +794,15 @@ local function BuildMainUI()
     btnGlow.ZIndex = 99
     btnGlow.Parent = toggleBtn
 
-    task.spawn(function()
-        while toggleBtn and toggleBtn.Parent do
-            safeCall(function()
-                TweenService:Create(btnGlow, TweenInfo.new(
-                    1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
-                ), {
-                    ImageTransparency = 0.9,
-                }):Play()
-            end)
-            task.wait(3)
-        end
+    safeCall(function()
+        TweenService:Create(btnGlow, TweenInfo.new(
+            1.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true
+        ), {
+            ImageTransparency = 0.9,
+        }):Play()
     end)
 
-    -- 按钮拖拽
+    -- 按钮拖拽 (带边界检查)
     local btnDragging = false
     local btnDragStart, btnStartPos
     local btnDragMoved = false
@@ -550,10 +831,14 @@ local function BuildMainUI()
             if delta.Magnitude > 8 then
                 btnDragMoved = true
             end
-            toggleBtn.Position = UDim2.new(
+            local newPos = UDim2.new(
                 btnStartPos.X.Scale, btnStartPos.X.Offset + delta.X,
                 btnStartPos.Y.Scale, btnStartPos.Y.Offset + delta.Y
             )
+            -- 边界检查
+            local screenSize = GuiService:GetScreenSize()
+            newPos = clampUdim2(newPos, toggleBtn.Size, screenSize)
+            toggleBtn.Position = newPos
         end
     end)
 
@@ -583,7 +868,6 @@ local function BuildMainUI()
 
     AcrylicPure.CreateGlow(panel, CONFIG.UI.AccentColor, 350)
 
-    -- 顶部标题区域
     local header = Instance.new("Frame")
     header.Name = "Header"
     header.Size = UDim2.new(1, 0, 0, 56)
@@ -616,7 +900,7 @@ local function BuildMainUI()
     subtitle.Size = UDim2.new(1, -60, 0, 14)
     subtitle.Position = UDim2.new(0, 50, 0.5, 6)
     subtitle.BackgroundTransparency = 1
-    subtitle.Text = "Acrylic Pure Edition"
+    subtitle.Text = "Acrylic Pure Edition v2.1"
     subtitle.TextColor3 = CONFIG.UI.SubTextColor
     subtitle.TextSize = 11
     subtitle.Font = Enum.Font.Gotham
@@ -625,7 +909,6 @@ local function BuildMainUI()
 
     AcrylicPure.CreateAccentLine(panel, UDim2.new(0, 12, 0, 56), UDim2.new(1, -24, 0, 1))
 
-    -- 功能列表区域
     local scrollFrame = Instance.new("ScrollingFrame")
     scrollFrame.Name = "FeatureList"
     scrollFrame.Size = UDim2.new(1, -16, 1, -80)
@@ -757,7 +1040,7 @@ local function BuildMainUI()
     end
 
     -----------------------------------------------------------------------
-    -- 注册功能
+    -- 注册功能 (使用修复后的独立系统)
     -----------------------------------------------------------------------
     FeatureInterface:Register("移动残影", CONFIG.Afterimage.Enabled, function(state)
         CONFIG.Afterimage.Enabled = state
@@ -778,49 +1061,18 @@ local function BuildMainUI()
     end)
 
     FeatureInterface:Register("高亮玩家", false, function(state)
-        for _, p in ipairs(Players:GetPlayers()) do
-            safeCall(function()
-                if not p.Character then return end
-                local highlight = p.Character:FindFirstChild("AcrylicHighlight")
-                if state then
-                    if not highlight then
-                        highlight = Instance.new("Highlight")
-                        highlight.Name = "AcrylicHighlight"
-                        highlight.FillColor = CONFIG.UI.AccentColor
-                        highlight.FillTransparency = 0.7
-                        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-                        highlight.OutlineTransparency = 0.3
-                        highlight.Parent = p.Character
-                    end
-                else
-                    if highlight then highlight:Destroy() end
-                end
-            end)
+        if state then
+            HighlightSystem:Start()
+        else
+            HighlightSystem:Stop()
         end
     end)
 
     FeatureInterface:Register("ESP线框", false, function(state)
-        for _, p in ipairs(Players:GetPlayers()) do
-            safeCall(function()
-                if p == player then return end
-                if not p.Character then return end
-                local espBox = p.Character:FindFirstChild("AcrylicESP")
-                if state then
-                    if not espBox then
-                        espBox = Instance.new("BoxHandleAdornment")
-                        espBox.Name = "AcrylicESP"
-                        espBox.Adornee = p.Character:FindFirstChild("HumanoidRootPart") or p.Character
-                        espBox.Size = Vector3.new(4, 5.5, 4)
-                        espBox.Color3 = CONFIG.UI.AccentColor
-                        espBox.Transparency = 0.6
-                        espBox.AlwaysOnTop = true
-                        espBox.ZIndex = 10
-                        espBox.Parent = p.Character
-                    end
-                else
-                    if espBox then espBox:Destroy() end
-                end
-            end)
+        if state then
+            ESPSystem:Start()
+        else
+            ESPSystem:Stop()
         end
     end)
 
@@ -860,21 +1112,24 @@ local function BuildMainUI()
                     task.spawn(function()
                         local lastTick = tick()
                         local frames = 0
-                        while fpsLabel and fpsLabel.Parent do
+                        while fpsLabel and fpsLabel.Parent and isDescendant(fpsLabel, game) do
                             frames = frames + 1
-                            if tick() - lastTick >= 1 then
+                            local currentTick = tick()
+                            if currentTick - lastTick >= 1 then
                                 safeCall(function()
                                     fpsLabel.Text = "FPS: " .. tostring(frames)
                                 end)
                                 frames = 0
-                                lastTick = tick()
+                                lastTick = currentTick
                             end
                             RunService.Heartbeat:Wait()
                         end
                     end)
                 end
             else
-                if fpsLabel then fpsLabel:Destroy() end
+                if fpsLabel and fpsLabel.Parent then 
+                    fpsLabel:Destroy() 
+                end
             end
         end)
     end)
@@ -913,7 +1168,7 @@ local function BuildMainUI()
     statusLabel.Parent = footer
 
     -----------------------------------------------------------------------
-    -- 面板拖拽
+    -- 面板拖拽 (带边界检查)
     -----------------------------------------------------------------------
     local dragging = false
     local dragStart, startPos
@@ -938,10 +1193,13 @@ local function BuildMainUI()
         if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            panel.Position = UDim2.new(
+            local newPos = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
+            local screenSize = GuiService:GetScreenSize()
+            newPos = clampUdim2(newPos, panel.Size, screenSize)
+            panel.Position = newPos
         end
     end)
 
@@ -997,7 +1255,6 @@ local function BuildMainUI()
         end
     end)
 
-    -- PC端也保留键盘快捷键
     UserInputService.InputBegan:Connect(function(input, gpe)
         if gpe then return end
         if input.KeyCode == Enum.KeyCode.RightControl then
@@ -1010,23 +1267,58 @@ local function BuildMainUI()
 end
 
 ---------------------------------------------------------------------------
+-- 等待角色部件就绪的工具函数
+---------------------------------------------------------------------------
+local function waitForCharacterReady(newChar)
+    return function(callback)
+        local bindable = Instance.new("BindableEvent")
+        
+        local function checkParts()
+            local hrp = newChar:FindFirstChild("HumanoidRootPart")
+            local hum = newChar:FindFirstChild("Humanoid")
+            if hrp and hum then
+                bindable:Fire({hrp = hrp, hum = hum})
+            end
+        end
+        
+        local conn = newChar.ChildAdded:Connect(checkParts)
+        checkParts()
+        
+        local result = bindable.Event:Wait()
+        conn:Disconnect()
+        bindable:Destroy()
+        
+        if callback then
+            callback(result.hrp, result.hum)
+        end
+        return result.hrp, result.hum
+    end
+end
+
+---------------------------------------------------------------------------
 -- 角色重生处理
 ---------------------------------------------------------------------------
-player.CharacterAdded:Connect(function(newChar)
+local characterAddedConn = player.CharacterAdded:Connect(function(newChar)
     character = newChar
-    humanoid = newChar:WaitForChild("Humanoid")
-    rootPart = newChar:WaitForChild("HumanoidRootPart")
-
-    if CONFIG.Afterimage.Enabled then
-        task.wait(0.5)
-        AfterimageSystem:Stop()
-        AfterimageSystem:Start()
-    end
-
-    if CONFIG.InfoCard.Enabled and CONFIG.InfoCard.ShowOnSelf then
-        task.wait(1)
-        safeCall(function() InfoCardSystem:CreatePlayerCard(player) end)
-    end
+    
+    -- 等待角色完全加载
+    local readyWaiter = waitForCharacterReady(newChar)
+    readyWaiter(function(hrp, hum)
+        rootPart = hrp
+        humanoid = hum
+        
+        -- 重启残影系统
+        if CONFIG.Afterimage.Enabled then
+            AfterimageSystem:Restart()
+        end
+        
+        -- 重启信息卡片（自己的）
+        if CONFIG.InfoCard.Enabled and CONFIG.InfoCard.ShowOnSelf then
+            -- 延迟一下让其他系统也更新
+            task.wait(0.5)
+            safeCall(function() InfoCardSystem:CreatePlayerCard(player) end)
+        end
+    end)
 end)
 
 ---------------------------------------------------------------------------
@@ -1034,6 +1326,7 @@ end)
 ---------------------------------------------------------------------------
 local mainUI = BuildMainUI()
 
+-- 启动启用的功能
 if CONFIG.Afterimage.Enabled then
     AfterimageSystem:Start()
 end
@@ -1042,4 +1335,24 @@ if CONFIG.InfoCard.Enabled then
     InfoCardSystem:Start()
 end
 
-print("[Acrylic Pure] 视觉脚本已加载 v2")
+-- 高亮和ESP默认是关闭的，由用户手动开启
+
+print("[Acrylic Pure] 视觉脚本已加载 v2.1 (修复版)")
+
+---------------------------------------------------------------------------
+-- 优雅退出 (可选)
+---------------------------------------------------------------------------
+local function cleanup()
+    safeCall(function()
+        AfterimageSystem:Stop()
+        InfoCardSystem:Stop()
+        HighlightSystem:Stop()
+        ESPSystem:Stop()
+        FeatureInterface:Cleanup()
+        if characterAddedConn then characterAddedConn:Disconnect() end
+        if mainUI then mainUI:Destroy() end
+    end)
+end
+
+-- 玩家离开时清理（脚本会自然销毁，但显式清理更安全）
+player.PlayerRemoving:Connect(cleanup)
